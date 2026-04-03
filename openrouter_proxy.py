@@ -61,28 +61,40 @@ def call_openrouter(model, messages):
 
 @app.route("/api/openrouter", methods=["POST"])
 def openrouter():
-    data = request.json
-    model = data.get("model", "z-ai/glm-4.5-air:free")
-    user_message_count = data.get("userMessageCount", 1)
+    try:
+        data = request.json
+        model = data.get("model", "z-ai/glm-4.5-air:free")
+        user_message_count = data.get("userMessageCount", 1)
 
-    # Accept full conversation history; fall back to single prompt for old clients
-    history = data.get("messages")
-    if not history:
-        user_prompt = data.get("prompt", "")
-        history = [{"role": "user", "content": user_prompt}]
+        # Accept full conversation history; fall back to single prompt for old clients
+        history = data.get("messages")
+        if not history:
+            user_prompt = data.get("prompt", "")
+            history = [{"role": "user", "content": user_prompt}]
 
-    messages = build_messages(history, user_message_count)
+        messages = build_messages(history, user_message_count)
 
-    response = call_openrouter(model, messages)
+        response = call_openrouter(model, messages)
 
-    if response.status_code == 200:
-        result = response.json()
-        generated_text = result["choices"][0]["message"]["content"]
-        return jsonify({"response": generated_text, "done": True, "model": model})
-    else:
+        if response.status_code == 200:
+            result = response.json()
+            generated_text = result["choices"][0]["message"]["content"]
+            return jsonify({"response": generated_text, "done": True, "model": model})
+        else:
+            error_msg = (
+                f"OpenRouter API error: {response.status_code} - {response.text[:200]}"
+            )
+            print(f"[ERROR] {error_msg}")
+            return (
+                jsonify({"error": error_msg}),
+                response.status_code,
+            )
+    except Exception as e:
+        error_msg = f"Exception in /api/openrouter: {str(e)}"
+        print(f"[ERROR] {error_msg}")
         return (
-            jsonify({"error": f"OpenRouter API error: {response.text}"}),
-            response.status_code,
+            jsonify({"error": error_msg}),
+            500,
         )
 
 
@@ -92,28 +104,40 @@ def generate():
     Legacy Ollama-compatible endpoint — kept for backward compatibility.
     Forwards to OpenRouter using the same model logic.
     """
-    data = request.json
-    model = data.get("model", "z-ai/glm-4.5-air:free")
-    user_message_count = data.get("userMessageCount", 1)
+    try:
+        data = request.json
+        model = data.get("model", "z-ai/glm-4.5-air:free")
+        user_message_count = data.get("userMessageCount", 1)
 
-    # Accept full conversation history; fall back to single prompt for old clients
-    history = data.get("messages")
-    if not history:
-        user_prompt = data.get("prompt", "")
-        history = [{"role": "user", "content": user_prompt}]
+        # Accept full conversation history; fall back to single prompt for old clients
+        history = data.get("messages")
+        if not history:
+            user_prompt = data.get("prompt", "")
+            history = [{"role": "user", "content": user_prompt}]
 
-    messages = build_messages(history, user_message_count)
+        messages = build_messages(history, user_message_count)
 
-    response = call_openrouter(model, messages)
+        response = call_openrouter(model, messages)
 
-    if response.status_code == 200:
-        result = response.json()
-        generated_text = result["choices"][0]["message"]["content"]
-        return jsonify({"response": generated_text, "done": True, "model": model})
-    else:
+        if response.status_code == 200:
+            result = response.json()
+            generated_text = result["choices"][0]["message"]["content"]
+            return jsonify({"response": generated_text, "done": True, "model": model})
+        else:
+            error_msg = (
+                f"OpenRouter API error: {response.status_code} - {response.text[:200]}"
+            )
+            print(f"[ERROR] {error_msg}")
+            return (
+                jsonify({"error": error_msg}),
+                response.status_code,
+            )
+    except Exception as e:
+        error_msg = f"Exception in /api/generate: {str(e)}"
+        print(f"[ERROR] {error_msg}")
         return (
-            jsonify({"error": f"OpenRouter API error: {response.text}"}),
-            response.status_code,
+            jsonify({"error": error_msg}),
+            500,
         )
 
 
