@@ -1,8 +1,18 @@
 import os
+import logging
 import concurrent.futures
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 import requests
+
+# Configure logging to output to stdout with clear formatting
+logging.basicConfig(
+    level=logging.INFO,
+    format="[%(levelname)s] %(asctime)s - %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+    handlers=[logging.StreamHandler()],
+)
+logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
 CORS(app)
@@ -11,6 +21,7 @@ OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "")
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 
 if not OPENROUTER_API_KEY:
+    logger.error("OPENROUTER_API_KEY environment variable is not set")
     raise RuntimeError(
         "OPENROUTER_API_KEY environment variable is not set. "
         "Export it before starting: export OPENROUTER_API_KEY=sk-or-v1-..."
@@ -35,7 +46,7 @@ FALLBACK_MODELS = [
 SYSTEM_PROMPT = (
     "Tu es ProutGPT et tu adores les prouts et les flatulences. "
     "Tu trouves les blagues de papa hilarantes et tu en fais tout le temps. "
-    "Tu parles français de manière naturelle et fluide car tu es Québécois (mais tu ne mentionnes pas ton origine sauf si on te le demande). "
+    "Tu parles français de manière naturelle et fluide."
     "Tu es très drôle, tu glisses souvent des références aux pets dans tes réponses, "
     "et tu adores faire des jeux de mots pourris comme un vrai papa. "
     "Tu es gentil et tu aimes aider les gens, mais toujours avec humour!"
@@ -80,37 +91,55 @@ def _try_model(model, messages):
             timeout=30,
         )
     except requests.exceptions.Timeout:
-        print(f"[WARN] Timeout on model {model}")
+        logger.warning(f"Timeout on model {model}")
         return None, model
 
     if response.status_code == 200:
-        print(f"[INFO] Success with model: {model}")
+        logger.info(f"Success with model: {model}")
         return response, model
 
     if response.status_code == 429:
-        print(f"[WARN] 429 rate-limited on {model}")
+        logger.warning(f"Rate-limited (429) on {model}")
         return None, model
 
     # Non-retryable error — return it so the caller can surface it
-    print(f"[ERROR] Non-retryable error {response.status_code} on {model}")
+    logger.error(f"Non-retryable error {response.status_code} on {model}")
     return response, model
 
 
 def call_openrouter_with_fallback(requested_model, messages):
     """
-    1. Race RACE_MODELS (plus requested_model if not already in the list) in
-       parallel — return the first successful (200) response.
-    2. If all racers fail with 429/timeout, try FALLBACK_MODELS sequentially.
+    1. Try the requested_model first (user's choice) — return if successful.
+    2. If the requested model fails with 429/timeout, race RACE_MODELS in parallel.
+    3. If all racers fail, try FALLBACK_MODELS sequentially.
     Returns (response, model_used) on success, or (last_response, None) on
     total failure.
     """
-    # Build the race pool: requested model first, then the standard racers
-    race_pool = [requested_model] + [m for m in RACE_MODELS if m != requested_model]
+    logger.info(f"Attempting user-requested model: {requested_model}")
 
-    print(f"[INFO] Racing {len(race_pool)} models in parallel: {race_pool}")
+    # Step 1: Try the user-requested model first
+    resp, model = _try_model(requested_model, messages)
+    if resp is not None and resp.status_code == 200:
+        logger.info(f"User-requested model succeeded: {requested_model}")
+        return resp, model
+
+    if resp is not None and resp.status_code not in (429,):
+        # Non-retryable error from the requested model
+        logger.error(
+            f"User-requested model failed with non-retryable error {resp.status_code}: {requested_model}"
+        )
+        return resp, model
+
+    logger.warning(
+        f"User-requested model unavailable ({resp.status_code if resp else 'timeout'}): {requested_model}. Falling back to race models."
+    )
+
+    # Step 2: Try racing the standard race models
+    race_pool = [m for m in RACE_MODELS if m != requested_model]
+    logger.info(f"Racing {len(race_pool)} fallback models in parallel: {race_pool}")
 
     first_success = None
-    last_response = None
+    last_response = resp
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=len(race_pool)) as executor:
         futures = {executor.submit(_try_model, m, messages): m for m in race_pool}
@@ -118,35 +147,44 @@ def call_openrouter_with_fallback(requested_model, messages):
             resp, model = fut.result()
             if resp is not None and resp.status_code == 200:
                 first_success = (resp, model)
-                # Cancel remaining futures (best-effort; in-flight requests
-                # will still complete but we ignore them)
+                logger.info(f"Race model succeeded: {model}")
                 for f in futures:
                     f.cancel()
                 break
             if resp is not None and resp.status_code not in (429,):
-                # Non-retryable error from one of the racers — surface it
+                # Non-retryable error from one of the racers
                 first_success = (resp, model)
+                logger.error(
+                    f"Race model failed with non-retryable error {resp.status_code}: {model}"
+                )
                 for f in futures:
                     f.cancel()
                 break
-            last_response = resp  # track last 429 response for error reporting
+            last_response = resp
 
     if first_success:
         return first_success
 
-    # All racers failed — try sequential fallbacks
-    fallbacks = [m for m in FALLBACK_MODELS if m not in race_pool]
-    print(f"[WARN] All racers failed. Trying {len(fallbacks)} sequential fallbacks...")
+    # Step 3: Try sequential fallbacks
+    fallbacks = [
+        m for m in FALLBACK_MODELS if m not in race_pool and m != requested_model
+    ]
+    logger.warning(
+        f"All race models failed. Trying {len(fallbacks)} sequential fallback models..."
+    )
     for model in fallbacks:
-        print(f"[INFO] Trying fallback model: {model}")
+        logger.info(f"Trying fallback model: {model}")
         resp, model_used = _try_model(model, messages)
         if resp is not None and resp.status_code == 200:
+            logger.info(f"Fallback model succeeded: {model}")
             return resp, model_used
         if resp is not None and resp.status_code not in (429,):
+            logger.error(f"Fallback model failed with non-retryable error: {model}")
             return resp, model_used
         if resp is not None:
             last_response = resp
 
+    logger.error("All models exhausted. Total failure.")
     return last_response, None
 
 
@@ -161,16 +199,18 @@ def handle_chat(data):
         user_prompt = data.get("prompt", "")
         history = [{"role": "user", "content": user_prompt}]
 
+    logger.info(f"Handling chat request with requested model: {model}")
     messages = build_messages(history, user_message_count)
     response, model_used = call_openrouter_with_fallback(model, messages)
 
     if response is not None and response.status_code == 200:
         result = response.json()
         generated_text = result["choices"][0]["message"]["content"]
+        logger.info(f"✓ Chat request successful - HTTP 200 - Model: {model_used}")
         return jsonify({"response": generated_text, "done": True, "model": model_used})
 
     error_msg = f"All models exhausted or failed. Last error: {response.status_code if response else 'timeout'} - {response.text[:200] if response else ''}"
-    print(f"[ERROR] {error_msg}")
+    logger.error(error_msg)
     return jsonify({"error": error_msg}), 503
 
 
@@ -180,7 +220,7 @@ def openrouter():
         return handle_chat(request.json)
     except Exception as e:
         error_msg = f"Exception in /api/openrouter: {str(e)}"
-        print(f"[ERROR] {error_msg}")
+        logger.exception(error_msg)
         return jsonify({"error": error_msg}), 500
 
 
@@ -194,7 +234,7 @@ def generate():
         return handle_chat(request.json)
     except Exception as e:
         error_msg = f"Exception in /api/generate: {str(e)}"
-        print(f"[ERROR] {error_msg}")
+        logger.exception(error_msg)
         return jsonify({"error": error_msg}), 500
 
 
@@ -204,4 +244,5 @@ def health():
 
 
 if __name__ == "__main__":
+    logger.info("Starting ProutGPT backend server on 0.0.0.0:5000")
     app.run(host="0.0.0.0", port=5000)
