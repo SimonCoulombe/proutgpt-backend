@@ -330,3 +330,11 @@ proutgpt-backend/
 
 Vibe-coded by Benoît Coulombe, Gaëlle Coulombe et Simon Coulombe.  
 Propulsé par des modèles IA gratuits et des blagues de pets.
+
+
+Useful commands:
+
+sudo systemctl status proutgpt     # check status
+sudo systemctl restart proutgpt    # restart after changes
+journalctl -u proutgpt -f          # follow live logs
+tail -f ~/openrouter.log           # same logs via file
