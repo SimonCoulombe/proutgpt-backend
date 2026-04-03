@@ -6,8 +6,9 @@ After=network.target
 Type=simple
 User=ubuntu
 WorkingDirectory=/home/ubuntu/proutgpt-backend
-# Load the API key from ~/.env
-EnvironmentFile=/home/ubuntu/.env
+# Load the API key from /etc/proutgpt.env (KEY=value format, no 'export')
+# Create it with: echo "OPENROUTER_API_KEY=sk-or-v1-..." | sudo tee /etc/proutgpt.env && sudo chmod 600 /etc/proutgpt.env
+EnvironmentFile=/etc/proutgpt.env
 ExecStart=/home/ubuntu/openrouter-env/bin/python /home/ubuntu/proutgpt-backend/openrouter_proxy.py
 Restart=on-failure
 RestartSec=5

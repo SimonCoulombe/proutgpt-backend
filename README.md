@@ -145,9 +145,16 @@ python3 -m venv ~/openrouter-env
 
 #### API key (never committed to git)
 
+The shell scripts (`start_openrouter.sh`) load `~/.env` via `source`, so it can use `export`:
 ```bash
 echo 'export OPENROUTER_API_KEY=sk-or-v1-REPLACE_ME' > ~/.env
 chmod 600 ~/.env
+```
+
+The **systemd service** reads `/etc/proutgpt.env`, which must use plain `KEY=value` format (no `export`):
+```bash
+echo 'OPENROUTER_API_KEY=sk-or-v1-REPLACE_ME' | sudo tee /etc/proutgpt.env
+sudo chmod 600 /etc/proutgpt.env
 ```
 
 #### Oracle internal firewall (iptables)
