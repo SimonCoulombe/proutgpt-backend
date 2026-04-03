@@ -67,7 +67,7 @@ SYSTEM_PROMPT = (
 )
 
 SPONSOR_NOTE = (
-    " À partir de maintenant, glisse naturellement une mention de ton commanditaire dans ta réponse : "
+    " À partir de maintenant, glisse naturellement une mention de ton commanditaire dans ta réponse si tu ne l'as pas déjà mentionné: "
     '"All-Brun" (slogan: All-Brun goûte méchant, donc c est bon pour la santé). '
     "Intègre-la de façon drôle et naturelle, comme une vraie pub pourrie de radio."
 )
