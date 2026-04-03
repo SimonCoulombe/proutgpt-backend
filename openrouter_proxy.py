@@ -24,18 +24,29 @@ SYSTEM_PROMPT = (
     "Tu es gentil et tu aimes aider les gens, mais toujours avec humour!"
 )
 
+SPONSOR_NOTE = (
+    " À partir de maintenant, glisse naturellement une mention de ton commanditaire dans ta réponse : "
+    '"All-Brun" (une céréale imaginaire et ridicule). '
+    "Intègre-la de façon drôle et naturelle, comme une vraie pub pourrie de radio."
+)
 
-@app.route("/api/openrouter", methods=["POST"])
-def openrouter():
-    data = request.json
-    user_prompt = data.get("prompt", "")
-    model = data.get("model", "z-ai/glm-4.5-air:free")
 
-    messages = [
-        {"role": "system", "content": SYSTEM_PROMPT},
-        {"role": "user", "content": user_prompt},
-    ]
+def build_messages(history, user_message_count):
+    """
+    Build the messages list for the OpenRouter API.
+    `history` is a list of {role, content} dicts (already includes the latest user message).
+    The sponsor note is added to the system prompt starting from the 2nd user message.
+    """
+    system_content = SYSTEM_PROMPT
+    if user_message_count >= 2:
+        system_content += SPONSOR_NOTE
 
+    messages = [{"role": "system", "content": system_content}]
+    messages.extend(history)
+    return messages
+
+
+def call_openrouter(model, messages):
     response = requests.post(
         OPENROUTER_URL,
         headers={
@@ -45,6 +56,24 @@ def openrouter():
         json={"model": model, "messages": messages},
         timeout=60,
     )
+    return response
+
+
+@app.route("/api/openrouter", methods=["POST"])
+def openrouter():
+    data = request.json
+    model = data.get("model", "z-ai/glm-4.5-air:free")
+    user_message_count = data.get("userMessageCount", 1)
+
+    # Accept full conversation history; fall back to single prompt for old clients
+    history = data.get("messages")
+    if not history:
+        user_prompt = data.get("prompt", "")
+        history = [{"role": "user", "content": user_prompt}]
+
+    messages = build_messages(history, user_message_count)
+
+    response = call_openrouter(model, messages)
 
     if response.status_code == 200:
         result = response.json()
@@ -64,23 +93,18 @@ def generate():
     Forwards to OpenRouter using the same model logic.
     """
     data = request.json
-    user_prompt = data.get("prompt", "")
     model = data.get("model", "z-ai/glm-4.5-air:free")
+    user_message_count = data.get("userMessageCount", 1)
 
-    messages = [
-        {"role": "system", "content": SYSTEM_PROMPT},
-        {"role": "user", "content": user_prompt},
-    ]
+    # Accept full conversation history; fall back to single prompt for old clients
+    history = data.get("messages")
+    if not history:
+        user_prompt = data.get("prompt", "")
+        history = [{"role": "user", "content": user_prompt}]
 
-    response = requests.post(
-        OPENROUTER_URL,
-        headers={
-            "Authorization": f"Bearer {OPENROUTER_API_KEY}",
-            "Content-Type": "application/json",
-        },
-        json={"model": model, "messages": messages},
-        timeout=60,
-    )
+    messages = build_messages(history, user_message_count)
+
+    response = call_openrouter(model, messages)
 
     if response.status_code == 200:
         result = response.json()
