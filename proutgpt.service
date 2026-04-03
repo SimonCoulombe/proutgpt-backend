@@ -1,0 +1,18 @@
+[Unit]
+Description=ProutGPT Backend (OpenRouter Proxy)
+After=network.target
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/home/ubuntu/proutgpt-backend
+# Load the API key from ~/.env
+EnvironmentFile=/home/ubuntu/.env
+ExecStart=/home/ubuntu/openrouter-env/bin/python /home/ubuntu/proutgpt-backend/openrouter_proxy.py
+Restart=on-failure
+RestartSec=5
+StandardOutput=append:/home/ubuntu/openrouter.log
+StandardError=append:/home/ubuntu/openrouter.log
+
+[Install]
+WantedBy=multi-user.target
