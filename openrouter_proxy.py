@@ -1,4 +1,5 @@
 import os
+import concurrent.futures
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 import requests
@@ -15,15 +16,20 @@ if not OPENROUTER_API_KEY:
         "Export it before starting: export OPENROUTER_API_KEY=sk-or-v1-..."
     )
 
-# All free models to try. The requested model is tried first, then these as fallbacks.
-FREE_MODELS_FALLBACK = [
-    "nvidia/nemotron-3-super-120b-a12b:free",
-    "z-ai/glm-4.5-air:free",
-    "stepfun/step-3.5-flash:free",
-    "nvidia/nemotron-nano-12b-v2-vl:free",
-    "nvidia/nemotron-nano-9b-v2:free",
+# These 3 are raced in parallel on every request — fastest non-429 wins.
+# All are small/fast models with good availability on free tier.
+RACE_MODELS = [
     "liquid/lfm-2.5-1.2b-instruct:free",
+    "stepfun/step-3.5-flash:free",
     "arcee-ai/trinity-mini:free",
+]
+
+# Sequential fallbacks if all 3 racers fail (429 or timeout).
+FALLBACK_MODELS = [
+    "z-ai/glm-4.5-air:free",
+    "nvidia/nemotron-nano-9b-v2:free",
+    "nvidia/nemotron-nano-12b-v2-vl:free",
+    "nvidia/nemotron-3-super-120b-a12b:free",
 ]
 
 SYSTEM_PROMPT = (
@@ -57,54 +63,96 @@ def build_messages(history, user_message_count):
     return messages
 
 
-def call_openrouter_with_fallback(requested_model, messages):
+def _try_model(model, messages):
     """
-    Try the requested model first. On 429 (rate-limited), immediately try each
-    fallback model in turn. Returns (response, model_used) on success, or
-    raises the last response on total failure.
+    Attempt a single model call. Returns (response, model) on HTTP success,
+    or raises an exception / returns (None, model) on 429/timeout so the
+    race can skip it.
     """
-    # Build ordered list: requested model first, then fallbacks (skipping duplicates)
-    models_to_try = [requested_model] + [
-        m for m in FREE_MODELS_FALLBACK if m != requested_model
-    ]
+    try:
+        response = requests.post(
+            OPENROUTER_URL,
+            headers={
+                "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+                "Content-Type": "application/json",
+            },
+            json={"model": model, "messages": messages},
+            timeout=30,
+        )
+    except requests.exceptions.Timeout:
+        print(f"[WARN] Timeout on model {model}")
+        return None, model
 
-    last_response = None
-    for model in models_to_try:
-        print(f"[INFO] Trying model: {model}")
-        try:
-            response = requests.post(
-                OPENROUTER_URL,
-                headers={
-                    "Authorization": f"Bearer {OPENROUTER_API_KEY}",
-                    "Content-Type": "application/json",
-                },
-                json={"model": model, "messages": messages},
-                timeout=30,
-            )
-        except requests.exceptions.Timeout:
-            print(f"[WARN] Timeout on model {model}, trying next...")
-            continue
-
-        if response.status_code == 200:
-            print(f"[INFO] Success with model: {model}")
-            return response, model
-
-        if response.status_code == 429:
-            print(f"[WARN] 429 rate-limited on {model}, trying next...")
-            last_response = response
-            continue
-
-        # Any other error (4xx/5xx that isn't 429) — stop and return it
-        print(f"[ERROR] Non-retryable error {response.status_code} on {model}")
+    if response.status_code == 200:
+        print(f"[INFO] Success with model: {model}")
         return response, model
 
-    # All models exhausted
+    if response.status_code == 429:
+        print(f"[WARN] 429 rate-limited on {model}")
+        return None, model
+
+    # Non-retryable error — return it so the caller can surface it
+    print(f"[ERROR] Non-retryable error {response.status_code} on {model}")
+    return response, model
+
+
+def call_openrouter_with_fallback(requested_model, messages):
+    """
+    1. Race RACE_MODELS (plus requested_model if not already in the list) in
+       parallel — return the first successful (200) response.
+    2. If all racers fail with 429/timeout, try FALLBACK_MODELS sequentially.
+    Returns (response, model_used) on success, or (last_response, None) on
+    total failure.
+    """
+    # Build the race pool: requested model first, then the standard racers
+    race_pool = [requested_model] + [m for m in RACE_MODELS if m != requested_model]
+
+    print(f"[INFO] Racing {len(race_pool)} models in parallel: {race_pool}")
+
+    first_success = None
+    last_response = None
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=len(race_pool)) as executor:
+        futures = {executor.submit(_try_model, m, messages): m for m in race_pool}
+        for fut in concurrent.futures.as_completed(futures):
+            resp, model = fut.result()
+            if resp is not None and resp.status_code == 200:
+                first_success = (resp, model)
+                # Cancel remaining futures (best-effort; in-flight requests
+                # will still complete but we ignore them)
+                for f in futures:
+                    f.cancel()
+                break
+            if resp is not None and resp.status_code not in (429,):
+                # Non-retryable error from one of the racers — surface it
+                first_success = (resp, model)
+                for f in futures:
+                    f.cancel()
+                break
+            last_response = resp  # track last 429 response for error reporting
+
+    if first_success:
+        return first_success
+
+    # All racers failed — try sequential fallbacks
+    fallbacks = [m for m in FALLBACK_MODELS if m not in race_pool]
+    print(f"[WARN] All racers failed. Trying {len(fallbacks)} sequential fallbacks...")
+    for model in fallbacks:
+        print(f"[INFO] Trying fallback model: {model}")
+        resp, model_used = _try_model(model, messages)
+        if resp is not None and resp.status_code == 200:
+            return resp, model_used
+        if resp is not None and resp.status_code not in (429,):
+            return resp, model_used
+        if resp is not None:
+            last_response = resp
+
     return last_response, None
 
 
 def handle_chat(data):
     """Shared logic for both /api/openrouter and /api/generate endpoints."""
-    model = data.get("model", FREE_MODELS_FALLBACK[0])
+    model = data.get("model", RACE_MODELS[0])
     user_message_count = data.get("userMessageCount", 1)
 
     # Accept full conversation history; fall back to single prompt for old clients
