@@ -1,30 +1,44 @@
-# ProutGPT Backend
+# ProutGPT Backend 💨
 
-Backend for [ProutGPT](https://github.com/simoncoulombe/proutgpt-chat) — the world's most sophisticated AI fart-joke chatbot.
+Flask proxy backend for [ProutGPT](https://proutgpt.com) — the world's most sophisticated fart-joke chatbot.
 
 This repo contains:
-- A **Flask proxy** that forwards requests to OpenRouter (cloud LLMs)
-- **Nginx config** to route traffic from your domain to the Flask API and local Ollama
-- A **systemd service** so the backend starts automatically at boot
+- A **Flask proxy** that forwards requests to OpenRouter (cloud LLMs) with parallel model racing and sequential fallbacks
+- **SSE streaming** endpoint for real-time token-by-token output
+- **Per-IP rate limiting** to prevent abuse
+- **Input validation** with sensible limits
+- **Nginx config** to route traffic from your domain to Flask and local Ollama
+- A **systemd + gunicorn** service for production-grade process management
 - A **one-shot setup script** for provisioning a fresh Oracle Cloud VM
-- Instructions for setting up **Ollama** to run local LLMs
 
 ---
 
 ## Architecture
 
 ```
-Browser (proutgpt-chat)
+Browser (proutgpt-chat SPA)
         │
-        ├─── /api/openrouter  ──►  nginx (port 80/443)
-        │                               │
-        │                               ├─► Flask proxy (port 5000)
-        │                               │       │
-        │                               │       └─► OpenRouter API (cloud)
+        ├── POST /api/openrouter  ──► nginx :80/:443 ──► gunicorn/Flask :5000 ──► OpenRouter API
+        │   (streaming SSE or JSON)
         │
-        └─── /api/generate   ──►  nginx  ──►  Ollama (port 11434)
-             /api/tags
+        ├── POST /api/generate   ──► (same, legacy compat)
+        │
+        ├── GET  /models          ──► returns available model list
+        │
+        ├── GET  /health          ──► liveness check
+        │
+        └── GET  /api/tags        ──► nginx ──► Ollama :11434  (local models)
 ```
+
+### Model fallback strategy
+
+On every request the backend attempts models in this order:
+
+1. **User-requested model** — if it returns 200, done.
+2. **Race** — 3 small fast models called in parallel (`ThreadPoolExecutor`); first 200 wins.
+3. **Sequential fallbacks** — 4 more models tried one by one if the race also fails.
+
+This makes the free-tier OpenRouter experience essentially always return a response even under heavy rate-limiting.
 
 ---
 
@@ -36,7 +50,6 @@ Go to **Oracle Cloud Console → Compute → Instances → Create Instance**.
 
 | Setting | Value |
 |---|---|
-| **Name** | `proutgpt-backend` |
 | **Image** | Canonical Ubuntu 22.04 |
 | **Shape** | Ampere `VM.Standard.A1.Flex` |
 | **OCPUs** | 4 |
@@ -45,58 +58,25 @@ Go to **Oracle Cloud Console → Compute → Instances → Create Instance**.
 | **Public IP** | Assign a public IPv4 address |
 | **SSH keys** | Upload your public key |
 
-Click **Create**.
+### 2. Open ports — Oracle VCN Security List
 
-### 2. Open ports — Oracle VCN Security List (via OCI CLI)
-
-The OCI Console web UI works, but the CLI is faster and repeatable.
-
-**Install the OCI CLI** (if not already done):
-```bash
-bash -c "$(curl -fsSL https://raw.githubusercontent.com/oracle/oci-cli/master/scripts/install/install.sh)"
-oci setup config    # follow the prompts
-```
-
-**Find your VCN and security list IDs:**
-```bash
-# List compartments (get your compartment OCID)
-oci iam compartment list --all --query 'data[*].{Name:name,OCID:id}' --output table
-
-# List VCNs in your compartment
-oci network vcn list --compartment-id <YOUR_COMPARTMENT_OCID> \
-  --query 'data[*].{Name:"display-name",OCID:id}' --output table
-
-# List security lists in the VCN
-oci network security-list list \
-  --compartment-id <YOUR_COMPARTMENT_OCID> \
-  --vcn-id <YOUR_VCN_OCID> \
-  --query 'data[*].{Name:"display-name",OCID:id}' --output table
-```
-
-**Add ingress rules for HTTP, HTTPS, and Ollama:**
 ```bash
 SECLIST_OCID="<YOUR_SECURITY_LIST_OCID>"
 
-# Get existing ingress rules first (don't overwrite them!)
-EXISTING=$(oci network security-list get --security-list-id "$SECLIST_OCID" \
-  --query 'data."ingress-security-rules"')
-
-# Add HTTP (80), HTTPS (443), Flask (5000), Ollama (11434)
 oci network security-list update \
   --security-list-id "$SECLIST_OCID" \
-  --ingress-security-rules "[
-    {\"protocol\": \"6\", \"source\": \"0.0.0.0/0\", \"tcpOptions\": {\"destinationPortRange\": {\"min\": 22,    \"max\": 22}}},
-    {\"protocol\": \"6\", \"source\": \"0.0.0.0/0\", \"tcpOptions\": {\"destinationPortRange\": {\"min\": 80,    \"max\": 80}}},
-    {\"protocol\": \"6\", \"source\": \"0.0.0.0/0\", \"tcpOptions\": {\"destinationPortRange\": {\"min\": 443,   \"max\": 443}}},
-    {\"protocol\": \"6\", \"source\": \"0.0.0.0/0\", \"tcpOptions\": {\"destinationPortRange\": {\"min\": 5000,  \"max\": 5000}}},
-    {\"protocol\": \"6\", \"source\": \"0.0.0.0/0\", \"tcpOptions\": {\"destinationPortRange\": {\"min\": 11434, \"max\": 11434}}}
-  ]" \
+  --ingress-security-rules '[
+    {"protocol":"6","source":"0.0.0.0/0","tcpOptions":{"destinationPortRange":{"min":22,   "max":22}}},
+    {"protocol":"6","source":"0.0.0.0/0","tcpOptions":{"destinationPortRange":{"min":80,   "max":80}}},
+    {"protocol":"6","source":"0.0.0.0/0","tcpOptions":{"destinationPortRange":{"min":443,  "max":443}}},
+    {"protocol":"6","source":"0.0.0.0/0","tcpOptions":{"destinationPortRange":{"min":5000, "max":5000}}}
+  ]' \
   --force
 ```
 
-> **Note:** Protocol `6` = TCP. This replaces the entire ingress list, so make sure to include SSH (22) and any other existing rules you want to keep.
+> Port 5000 can be removed from the security list once nginx is confirmed working — all public traffic should go through 80/443.
 
-### 3. SSH into the VM
+### 3. SSH in
 
 ```bash
 ssh ubuntu@<VM_PUBLIC_IP>
@@ -109,23 +89,10 @@ ssh ubuntu@<VM_PUBLIC_IP>
 ### Option A — One-shot automated setup
 
 ```bash
-# Clone this repo
 git clone https://github.com/simoncoulombe/proutgpt-backend.git
 cd proutgpt-backend
-
-# Create your API key file (never committed to git)
-echo 'export OPENROUTER_API_KEY=sk-or-v1-...' > ~/.env
-
-# Run the setup script
 bash setup_vm.sh
 ```
-
-This script will:
-- Install Python 3, nginx, curl, git
-- Create a Python virtualenv and install Flask dependencies
-- Install Ollama and pull `llama3.2`
-- Deploy the nginx config
-- Install and enable the `proutgpt` systemd service
 
 ### Option B — Manual step-by-step
 
@@ -136,36 +103,36 @@ sudo apt-get update
 sudo apt-get install -y python3 python3-pip python3-venv nginx curl git iptables-persistent
 ```
 
-#### Python virtualenv
+#### Python virtualenv + dependencies
 
 ```bash
 python3 -m venv ~/openrouter-env
 ~/openrouter-env/bin/pip install -r requirements.txt
+# requirements.txt includes: flask, flask-cors, requests, gunicorn
 ```
 
-#### API key (never committed to git)
+#### API key
 
-The shell scripts (`start_openrouter.sh`) load `~/.env` via `source`, so it can use `export`:
+Two files are needed — one for interactive use, one for systemd:
+
 ```bash
+# For start_openrouter.sh / interactive use
 echo 'export OPENROUTER_API_KEY=sk-or-v1-REPLACE_ME' > ~/.env
 chmod 600 ~/.env
-```
 
-The **systemd service** reads `/etc/proutgpt.env`, which must use plain `KEY=value` format (no `export`):
-```bash
+# For systemd (KEY=value, no 'export')
 echo 'OPENROUTER_API_KEY=sk-or-v1-REPLACE_ME' | sudo tee /etc/proutgpt.env
 sudo chmod 600 /etc/proutgpt.env
 ```
 
-#### Oracle internal firewall (iptables)
+#### OS-level firewall (iptables)
 
-Oracle VMs also have an OS-level firewall. Open the ports:
+Oracle VMs have an OS firewall in addition to the VCN security list:
 
 ```bash
-sudo iptables -I INPUT -p tcp --dport 80    -j ACCEPT
-sudo iptables -I INPUT -p tcp --dport 443   -j ACCEPT
-sudo iptables -I INPUT -p tcp --dport 5000  -j ACCEPT
-sudo iptables -I INPUT -p tcp --dport 11434 -j ACCEPT
+sudo iptables -I INPUT -p tcp --dport 80   -j ACCEPT
+sudo iptables -I INPUT -p tcp --dport 443  -j ACCEPT
+sudo iptables -I INPUT -p tcp --dport 5000 -j ACCEPT
 sudo netfilter-persistent save
 ```
 
@@ -173,96 +140,87 @@ sudo netfilter-persistent save
 
 ## Nginx Setup
 
-The config is at `nginx/proutgpt.conf`.
-
 ```bash
-# Edit domain name if needed
-sudo nano nginx/proutgpt.conf   # replace api.proutgpt.com with your domain or IP
-
-# Install the config
 sudo cp nginx/proutgpt.conf /etc/nginx/sites-available/proutgpt.conf
 sudo ln -s /etc/nginx/sites-available/proutgpt.conf /etc/nginx/sites-enabled/
-sudo rm -f /etc/nginx/sites-enabled/default   # remove default site
+sudo rm -f /etc/nginx/sites-enabled/default
 sudo nginx -t && sudo systemctl restart nginx
 ```
 
-### Add HTTPS with Let's Encrypt
+### HTTPS with Let's Encrypt
 
 ```bash
 sudo apt install -y certbot python3-certbot-nginx
 sudo certbot --nginx -d api.proutgpt.com
+# Auto-renewal is set up by certbot via a systemd timer
 ```
-
-Certbot will automatically update the nginx config and set up a renewal cron job.
 
 ---
 
 ## Ollama Setup (local LLMs)
 
-### Install Ollama
-
 ```bash
+# Install
 curl -fsSL https://ollama.com/install.sh | sh
-sudo systemctl enable ollama
-sudo systemctl start ollama
-```
+sudo systemctl enable --now ollama
 
-### Pull the llama3.2 model
-
-```bash
+# Pull a model
 ollama pull llama3.2
-```
 
-This downloads ~2 GB. On a 24 GB Ampere VM it runs at a decent speed.
-
-### Test Ollama directly
-
-```bash
+# Test
 curl http://localhost:11434/api/generate \
   -d '{"model":"llama3.2","prompt":"dis bonjour","stream":false}'
 ```
 
-### Expose Ollama via nginx
-
-The nginx config already proxies `/ollama/` → `localhost:11434`. From the frontend, set the API URL to `https://api.proutgpt.com/ollama` and choose the Ollama backend.
+The nginx config proxies `/ollama/` → `localhost:11434`.
+Set the frontend API URL to `https://api.proutgpt.com/ollama` and select the Ollama backend.
 
 ---
 
-## Systemd Service (auto-start on boot)
+## Systemd Service (production)
+
+The service runs the Flask app under **gunicorn** (4 workers, 120 s timeout):
 
 ```bash
-# Install the service
+# Install and enable
 sudo cp proutgpt.service /etc/systemd/system/
 sudo systemctl daemon-reload
-sudo systemctl enable proutgpt
-sudo systemctl start proutgpt
+sudo systemctl enable --now proutgpt
 
-# Check status
-sudo systemctl status proutgpt
-
-# View logs
-journalctl -u proutgpt -f
-# or
-tail -f ~/openrouter.log
+# Day-to-day operations
+sudo systemctl status proutgpt        # check status
+sudo systemctl restart proutgpt       # restart after code changes
+journalctl -u proutgpt -f             # follow live logs
 ```
-
-The service reads `~/.env` for the API key via `EnvironmentFile`.
 
 ---
 
 ## Running Locally (development)
 
 ```bash
-# Set your API key
 export OPENROUTER_API_KEY=sk-or-v1-...
 
-# Start the server
+# Option 1 — helper script (creates venv, installs deps, starts Flask dev server)
 bash start_openrouter.sh
-# or directly:
+
+# Option 2 — direct gunicorn (mirrors production)
+~/openrouter-env/bin/gunicorn --workers 2 --bind 0.0.0.0:5000 openrouter_proxy:app
+
+# Option 3 — plain python (single-threaded, debug mode)
 ~/openrouter-env/bin/python openrouter_proxy.py
 ```
 
-The server listens on `http://0.0.0.0:5000`.
+Server listens on `http://0.0.0.0:5000`.
+
+---
+
+## Environment variables
+
+| Variable | Required | Default | Description |
+|---|---|---|---|
+| `OPENROUTER_API_KEY` | **Yes** | — | OpenRouter secret key (`sk-or-v1-…`) |
+| `RATE_LIMIT_MAX` | No | `20` | Max requests per IP per window |
+| `RATE_LIMIT_WINDOW` | No | `60` | Rate-limit window in seconds |
 
 ---
 
@@ -270,32 +228,70 @@ The server listens on `http://0.0.0.0:5000`.
 
 ### `POST /api/openrouter`
 
-Proxy a chat message to OpenRouter.
+Send a chat message (main endpoint used by the frontend).
 
 **Request body:**
 ```json
 {
-  "prompt": "Fais une blague de prout",
-  "model": "z-ai/glm-4.5-air:free"
+  "messages": [
+    {"role": "user", "content": "Fais une blague de prout"}
+  ],
+  "model": "z-ai/glm-4.5-air:free",
+  "userMessageCount": 1,
+  "stream": false
 }
 ```
 
-**Response:**
+Set `"stream": true` to receive a Server-Sent Events (SSE) stream instead of a JSON response.
+
+**Response (non-streaming):**
 ```json
 {
-  "response": "Pourquoi les pétomanes vont-ils à l'opéra ? ...",
+  "response": "Pourquoi les pétomanes font-ils du yoga ? ...",
   "done": true,
   "model": "z-ai/glm-4.5-air:free"
 }
 ```
 
+**Response (streaming, `Content-Type: text/event-stream`):**
+```
+data: {"token": "Pourquoi"}
+data: {"token": " les"}
+data: {"token": " pétomanes"}
+...
+data: {"done": true, "model": "z-ai/glm-4.5-air:free"}
+data: [DONE]
+```
+
 ### `POST /api/generate`
 
-Legacy Ollama-compatible endpoint (also proxies to OpenRouter).
+Legacy Ollama-compatible endpoint — identical behaviour to `/api/openrouter`.
+
+### `GET /models`
+
+Returns the full list of available OpenRouter models.
+
+```json
+{
+  "race_models": ["liquid/lfm-2.5-1.2b-instruct:free", "..."],
+  "fallback_models": ["z-ai/glm-4.5-air:free", "..."],
+  "all_models": ["..."]
+}
+```
 
 ### `GET /health`
 
-Returns `{"status": "ok"}`.
+Liveness check. Returns `{"status": "ok"}`.
+
+---
+
+## Validation limits
+
+| Field | Limit |
+|---|---|
+| Messages in history | 40 max |
+| Characters per message | 4 000 max |
+| Requests per IP / 60 s | 20 (configurable via env) |
 
 ---
 
@@ -303,15 +299,15 @@ Returns `{"status": "ok"}`.
 
 ```
 proutgpt-backend/
-├── openrouter_proxy.py     # Flask app — the actual proxy
-├── start_openrouter.sh     # Start script for manual / dev use
-├── setup_vm.sh             # One-shot VM provisioning script
-├── requirements.txt        # Python dependencies
-├── proutgpt.service        # systemd service definition
-├── .env.example            # Template for ~/.env (copy, fill, keep private)
+├── openrouter_proxy.py     # Flask app — proxy, streaming, rate-limiting
+├── requirements.txt        # flask, flask-cors, requests, gunicorn
+├── proutgpt.service        # systemd unit (gunicorn, 4 workers)
+├── start_openrouter.sh     # Dev/manual start script
+├── setup_vm.sh             # One-shot Oracle Cloud VM provisioning
+├── .env.example            # Template for ~/.env
 ├── .gitignore
 ├── nginx/
-│   └── proutgpt.conf       # Nginx reverse-proxy config
+│   └── proutgpt.conf       # Nginx reverse-proxy + SSE buffering disabled
 └── README.md
 ```
 
@@ -319,22 +315,15 @@ proutgpt-backend/
 
 ## Security Notes
 
-- **The OpenRouter API key is stored in `~/.env` on the server — never in the repo.**
-- `~/.env` is in `.gitignore` and loaded by the systemd service via `EnvironmentFile`.
-- Consider restricting port `5000` in the nginx config and VCN security list once nginx is working (all traffic should go through nginx on 80/443).
-- Ollama port `11434` is only needed if you expose it directly; otherwise close it in the VCN security list.
+- **API key is never in the repo** — stored in `~/.env` (dev) or `/etc/proutgpt.env` (systemd).
+- Rate limiting (20 req / 60 s per IP) is enforced in-process; add nginx `limit_req` for extra protection.
+- Port 5000 should be closed in the VCN security list in production (traffic goes through nginx on 443 only).
+- Ollama port 11434 should be firewalled unless you intentionally expose it.
+- `CORS(app)` allows all origins — restrict to your frontend domain in production if needed.
 
 ---
 
 ## Credits
 
-Vibe-coded by Benoît Coulombe, Gaëlle Coulombe et Simon Coulombe.  
-Propulsé par des modèles IA gratuits et des blagues de pets.
-
-
-Useful commands:
-
-sudo systemctl status proutgpt     # check status
-sudo systemctl restart proutgpt    # restart after changes
-journalctl -u proutgpt -f          # follow live logs
-tail -f ~/openrouter.log           # same logs via file
+Vibe-coded by **Benoît Coulombe**, **Gaëlle Coulombe** et **Simon Coulombe**.  
+Propulsé par des modèles IA gratuits et des blagues de pets 💨
