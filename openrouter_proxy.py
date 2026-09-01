@@ -40,19 +40,10 @@ if not OPENROUTER_API_KEY:
     )
 
 # Models raced in parallel — fastest non-429 response wins.
-RACE_MODELS = [
-    "liquid/lfm-2.5-1.2b-instruct:free",
-    "stepfun/step-3.5-flash:free",
-    "arcee-ai/trinity-mini:free",
-]
+RACE_MODELS = ["openrouter/free"]
 
-# Sequential fallbacks if all racers fail.
-FALLBACK_MODELS = [
-    "z-ai/glm-4.5-air:free",
-    "nvidia/nemotron-nano-9b-v2:free",
-    "nvidia/nemotron-nano-12b-v2-vl:free",
-    "nvidia/nemotron-3-super-120b-a12b:free",
-]
+# No model-specific fallbacks: OpenRouter selects the available free model.
+FALLBACK_MODELS = []
 
 # All models exposed to the frontend via /models
 ALL_OPENROUTER_MODELS = RACE_MODELS + FALLBACK_MODELS
